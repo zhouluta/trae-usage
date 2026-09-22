@@ -22,8 +22,10 @@ Cookie 获取方式（会话过期后需重新获取）：
   python trae_usage.py --days 7      # 趋势/明细只看最近 N 天（默认 31）
   python trae_usage.py --no-color    # 关闭颜色（管道/日志重定向时有用）
   python trae_usage.py --width 100   # 强制报告宽度（默认按终端宽度自适应）
-  python trae_usage.py --no-zebra    # 关闭隔行底色（斑马纹）
+  python trae_usage.py --no-zebra    # 关闭分组/隔行底色
   python trae_usage.py --zebra-theme light  # 浅色终端用浅灰底（默认 auto 探测）
+  python trae_usage.py --zebra-level strong # 底色更深/更浅，对比度最高（subtle|normal|strong）
+  python trae_usage.py --no-group-sep       # 去掉分组之间的分隔横线
 """
 import argparse
 import json
@@ -222,11 +224,19 @@ def _bg_theme():
     return None
 
 
-def draw_table(W, headers, rows, widths=None, zebra=True, zebra_theme="auto"):
-    """通用表格渲染：Unicode 边框 + 列分隔 + 斑马纹行底，提升行间区分度。
+def draw_table(W, headers, rows, widths=None, zebra=True, zebra_theme="auto",
+               groups=None, group_sep=True, zebra_level="normal"):
+    """通用表格渲染：Unicode 边框 + 列分隔 + 按组斑马纹，提升行间/组间区分度。
     headers: [(文本, 颜色), ...]   rows: [[(文本, 颜色), ...], ...]
     widths:  可选，各列显示宽度（中文计 2）；省略按内容自适应。保证整体宽度恰好 = W。
-    zebra:   隔行铺底色，横向扫读更易区分行；zebra_theme 控制深/浅终端底色。"""
+    zebra:   铺底色，横向扫读更易区分行；zebra_theme 控制深/浅终端底色。
+    groups:  可选，长度与 rows 相同的“分组号”列表。同一组的行共享同一底色，
+             且组间会插入一条分隔横线——用于“一个模型对应多行分档”这类表格，
+             避免列数变多后看串。省略时每行各为一组（等价于旧的按行斑马纹）。
+    group_sep: 是否插入组间分隔横线（默认开；仅在给出 groups 时生效）。
+             为免表格被横线撑得过高，只在「相邻两组中至少有一组是多行」的边界画线——
+             单行组之间靠底色交替区分即可；多行块前后各画一条，把整块框出来。
+    zebra_level: 底色深浅 'subtle' / 'normal' / 'strong'（默认 normal，高对比）。"""
     n = len(headers)
     if widths is None:
         widths = [dwidth(h[0]) for h in headers]
@@ -254,21 +264,34 @@ def draw_table(W, headers, rows, widths=None, zebra=True, zebra_theme="auto"):
         line.append(r)
         return paint("".join(line), CYAN)
 
-    # 斑马行底色（仅彩色输出时启用；auto 探测失败则按深色终端处理）
-    band = ""
+    # 斑马底色：按“组”交替（不给 groups 时每组一行，等价按行交替）
+    # 仅彩色输出时启用；auto 探测失败则按深色终端处理
+    shades = ("", "")
     if zebra and COLOR_ON:
         theme = zebra_theme if zebra_theme != "auto" else (_bg_theme() or "dark")
-        band = ZEBRA_DARK if theme == "dark" else ZEBRA_LIGHT
+        shades = ZEBRA.get(theme, ZEBRA["dark"]).get(zebra_level, ZEBRA["dark"]["normal"])
+
+    # 每组行数：用于判断哪些组边界值得画分隔线
+    gsize = {}
+    if groups is not None:
+        for g in groups:
+            gsize[g] = gsize.get(g, 0) + 1
 
     print(hline(TL, TR, JT))
     head = []
     for j, (t, c) in enumerate(headers):
         if dwidth(t) > widths[j]:
             t = dellipsis(t, widths[j])
-        head.append(dpad(t, widths[j], "<" if j == 0 else ">", c))
+        head.append(dpad(t, widths[j], "<" if j == 0 else ">", BOLD + c if COLOR_ON else c))
     print(VC + VC.join(head) + VC)
     print(hline(ML, MR, JC))
     for idx, row in enumerate(rows):
+        # 组间分隔横线：仅当相邻两组中至少一组是多行时画（单行组靠底色交替已足够）
+        if group_sep and groups is not None and idx > 0:
+            gp, gc = groups[idx - 1], groups[idx]
+            if gp != gc and (gsize.get(gp, 1) > 1 or gsize.get(gc, 1) > 1):
+                print(hline(ML, MR, JC))
+        band = shades[(groups[idx] if groups is not None else idx) % 2]
         parts = []
         for j, (t, c) in enumerate(row):
             s = str(t)
@@ -278,10 +301,7 @@ def draw_table(W, headers, rows, widths=None, zebra=True, zebra_theme="auto"):
             # 斑马行内不插 RESET：底色靠整行首尾各一次 RESET 维持不间断
             parts.append((c + padded) if (c and COLOR_ON) else padded)
         line = VCN + VCN.join(parts) + VCN
-        if band and (idx % 2 == 1):
-            print(band + line + RESET)
-        else:
-            print(line + RESET)
+        print((band + line + RESET) if band else (line + RESET))
     print(hline(BL, BR, JB))
 
 
@@ -299,10 +319,22 @@ BLUE = "\033[94m"
 MAGENTA = "\033[95m"
 WHITE = "\033[97m"
 
-# 斑马纹行底：隔行铺浅色底块，提升行间区分度。
-# 深色终端使用略亮于背景的灰色；浅色终端使用浅灰。均通过 ANSI 背景色实现。
-ZEBRA_DARK = "\033[48;5;235m"            # 约 #262626
-ZEBRA_LIGHT = "\033[48;2;238;238;238m"   # 约 #eeeeee
+# 斑马纹行底：按“组”交替两种底色（见 draw_table 的 groups 参数）。
+# 深色终端用两级深灰（A 浅 / B 深），浅色终端用两级蓝灰，均通过 ANSI 背景色实现。
+# subtle = 仅 B 有底色（接近旧效果）；normal 起即为高对比；strong 最抢眼。
+ZEBRA = {
+    # A = 偶数组（浅一档），B = 奇数组（深一档）；两者差异越大，组边界越明显
+    "dark": {
+        "subtle": ("", "\033[48;5;235m"),
+        "normal": ("\033[48;5;233m", "\033[48;5;239m"),
+        "strong": ("\033[48;5;235m", "\033[48;5;244m"),
+    },
+    "light": {
+        "subtle": ("", "\033[48;2;242;242;242m"),
+        "normal": ("\033[48;2;246;247;250m", "\033[48;2;225;231;240m"),
+        "strong": ("\033[48;2;238;241;247m", "\033[48;2;205;216;235m"),
+    },
+}
 
 COLOR_ON = True
 
@@ -503,7 +535,8 @@ def get_width(args):
     return max(48, min(cols, 200))
 
 
-def print_model_prices(W, zebra=True, zebra_theme="auto", preset=None):
+def print_model_prices(W, zebra=True, zebra_theme="auto", preset=None,
+                       zebra_level="normal", group_sep=True):
     """渲染模型单价参考表：优先实时抓取官网，成功后写入本地缓存，供下次离线读取。
     preset: 可选，main 中并发预取得到的 (prices, source, has_active, fetched_at)，传入可避免重复请求。"""
     prices, source, has_active, fetched_at, parse_hint = preset if preset is not None else get_model_prices()
@@ -527,20 +560,29 @@ def print_model_prices(W, zebra=True, zebra_theme="auto", preset=None):
     headers = [("模型", BLUE), ("上下文", GREEN), ("输入", GREEN),
                ("输出", GREEN), ("缓存", GREEN)]
     widths = [NAME_W, CTX_W, IN_W, OUT_W, CACHE_W]
-    rows = []
-    for name, tiers in prices:
+    rows, groups = [], []
+    for gi, (name, tiers) in enumerate(prices, 1):
         for i, tier in enumerate(tiers):
             ctx, pin, pout, pcache = tier
-            nm = name if i == 0 else ""
-            nm = dellipsis(nm, NAME_W)
-            col = WHITE if i == 0 else DIM
+            # 分组渲染：组首带序号、蓝/粗；续行用树形前缀并「重复模型名」。
+            # 这样即使窗口拉宽、列间距变大，每一行都能自证归属，不会和相邻模型看串。
+            if i == 0:
+                pre, col = f"{gi:>2}. ", (BOLD + BLUE)
+            elif i == len(tiers) - 1:
+                pre, col = "  └ ", DIM
+            else:
+                pre, col = "  ├ ", DIM
+            nm = dellipsis(pre + name, NAME_W)
             rows.append([
-                (nm, BLUE if i == 0 else DIM),
-                (ctx if ctx != "-" else "-", col),
-                (pin, col), (pout, col), (pcache, col),
+                (nm, col),
+                (ctx if ctx != "-" else "-", WHITE),
+                (pin, WHITE), (pout, WHITE), (pcache, WHITE),
             ])
-    draw_table(W, headers, rows, widths, zebra=zebra, zebra_theme=zebra_theme)
-    print(paint("  单位：元 / 百万 Tokens。按上下文分档的模型已逐档列出。", DIM))
+            groups.append(gi)   # 同一模型的所有档位 → 同一组（同底色、组间分隔线）
+    draw_table(W, headers, rows, widths, zebra=zebra, zebra_theme=zebra_theme,
+               groups=groups, group_sep=group_sep, zebra_level=zebra_level)
+    print(paint("  单位：元 / 百万 Tokens。一个模型有多档上下文时，该模型的各档共用一块底色，"
+                "组首带序号，续行以 ├─ / └─ 标出并重复模型名。", DIM))
     if has_active:
         # 从本次数据中选取第一个含活动价的模型作为示例
         for nm, tiers in prices:
@@ -586,6 +628,10 @@ def main():
     ap.add_argument("--no-zebra", action="store_true", help="关闭隔行底色（斑马纹）")
     ap.add_argument("--zebra-theme", choices=["auto", "dark", "light"],
                    default="auto", help="隔行底色适用的终端主题（auto=探测，默认深色）")
+    ap.add_argument("--zebra-level", choices=["subtle", "normal", "strong"],
+                   default="normal", help="底色深浅（默认 normal，高对比；strong 最强）")
+    ap.add_argument("--no-group-sep", action="store_true",
+                   help="关闭分组分隔横线（模型多档 / 合计行上方的横线）")
     args = ap.parse_args()
     if args.no_color:
         COLOR_ON = False
@@ -596,6 +642,8 @@ def main():
     W = get_width(args)
     zebra = not args.no_zebra
     zebra_theme = args.zebra_theme
+    zebra_level = args.zebra_level
+    group_sep = not args.no_group_sep
 
     COOKIE_VALUE = load_cookie()
     if not COOKIE_VALUE:
@@ -803,10 +851,14 @@ def main():
             (money(round(total_cost, 2)), BOLD), ("100.0%", BOLD),
             ("100.0%", BOLD), (total_tt, BOLD),
         ])
-        draw_table(W, headers, rows, widths, zebra=zebra, zebra_theme=zebra_theme)
+        draw_table(W, headers, rows, widths, zebra=zebra, zebra_theme=zebra_theme,
+                   # 数据行同组、合计行另起一组 → 合计上方自动插入一条分隔横线
+                   groups=[0] * (len(rows) - 1) + [1], group_sep=group_sep,
+                   zebra_level=zebra_level)
 
     # ---- 模型单价参考 ----
-    print_model_prices(W, zebra, zebra_theme, preset=price_result)
+    print_model_prices(W, zebra, zebra_theme, preset=price_result,
+                       zebra_level=zebra_level, group_sep=group_sep)
 
     # ---- 每日趋势 ----
     if "Data" in trend and trend["Data"].get("xAxis"):
@@ -843,7 +895,8 @@ def main():
                 (fmt_num(it.get("tokens_usage")), WHITE),
                 (money(round(it.get("total_cost_currency") or 0, 2)), WHITE),
             ])
-        draw_table(W, headers, rows, widths, zebra=zebra, zebra_theme=zebra_theme)
+        draw_table(W, headers, rows, widths, zebra=zebra, zebra_theme=zebra_theme,
+                   zebra_level=zebra_level)
         print(paint(f"  [i] 明细按最近 {args.days} 天窗口由接口返回；若条数与实际调用不符，可能受接口条数上限限制。", DIM))
 
     print()
